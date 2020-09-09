@@ -12,16 +12,19 @@ use crate::{
         },
         communication_interface::{ArmCommunicationInterfaceState, ArmProbeInterface},
         dp::{DPAccess, DPBankSel, DPRegister, DebugPortError, Select},
-        memory::Component,
+        memory::{adi_v5_memory_interface::ArmProbe, Component},
         ApInformation, ArmChipInfo, SwoAccess, SwoConfig, SwoMode,
     },
-    DebugProbeSelector, Error as ProbeRsError, Memory, MemoryInterface, Probe,
+    DebugProbeSelector, Error as ProbeRsError, Memory, Probe,
 };
 use constants::{commands, JTagFrequencyToDivider, Mode, Status, SwdFrequencyToDelayCount};
 use scroll::{Pread, Pwrite, BE, LE};
 use std::{cmp::Ordering, convert::TryInto, time::Duration};
 use thiserror::Error;
 use usb_interface::TIMEOUT;
+
+const STLINK_MAX_READ_LEN: usize = 6144;
+const STLINK_MAX_WRITE_LEN: usize = 16384;
 
 #[derive(Debug)]
 pub struct STLink<D: StLinkUsb> {
@@ -298,20 +301,10 @@ impl DAPAccess for STLink<STLinkUSBDevice> {
             ];
             let mut buf = [0; 2];
             self.send_jtag_command(cmd, &[], &mut buf, TIMEOUT)?;
-
-            // Ensure the write is actually performed.
-            self.flush()?;
-
             Ok(())
         } else {
             Err(StlinkError::BlanksNotAllowedOnDPRegister.into())
         }
-    }
-
-    fn flush(&mut self) -> Result<(), DebugProbeError> {
-        self.read_register(PortType::DebugPort, 0xc)?;
-
-        Ok(())
     }
 
     fn into_probe(self: Box<Self>) -> Box<dyn DebugProbe> {
@@ -786,27 +779,25 @@ impl<D: StLinkUsb> STLink<D> {
     fn read_mem_32bit(
         &mut self,
         address: u32,
-        length: u16,
+        data: &mut [u8],
         apsel: u8,
-    ) -> Result<Vec<u32>, DebugProbeError> {
+    ) -> Result<(), DebugProbeError> {
         log::debug!(
             "Read mem 32 bit, address={:08x}, length={}",
             address,
-            length
+            data.len()
         );
         // Maximum supported read length is 2^16 bytes.
         assert!(
-            length < (u16::MAX / 4),
-            "Maximum read length for STLink is 16'384 words"
+            data.len() <= 6144,
+            "Maximum read length for STLink is 6144 bytes"
         );
 
         if address % 4 != 0 {
             todo!("Should return an error here");
         }
 
-        let byte_length = length * 4;
-
-        let mut receive_buffer = vec![0u8; byte_length as usize];
+        let data_length = data.len();
 
         self.device.write(
             &[
@@ -816,33 +807,33 @@ impl<D: StLinkUsb> STLink<D> {
                 (address >> 8) as u8,
                 (address >> 16) as u8,
                 (address >> 24) as u8,
-                byte_length as u8,
-                (byte_length >> 8) as u8,
+                data_length as u8,
+                (data_length >> 8) as u8,
                 apsel,
             ],
             &[],
-            &mut receive_buffer,
+            data,
             TIMEOUT,
         )?;
 
         self.get_last_rw_status()?;
 
-        let words: Vec<u32> = receive_buffer
-            .chunks_exact(4)
-            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
-            .collect();
-
-        Ok(words)
+        Ok(())
     }
 
     fn read_mem_8bit(
         &mut self,
         address: u32,
-        length: u16,
+        data: &mut [u8],
         apsel: u8,
-    ) -> Result<Vec<u8>, DebugProbeError> {
-        log::debug!("Read mem 8 bit, address={:08x}, length={}", address, length);
-        let mut receive_buffer = vec![0u8; length as usize];
+    ) -> Result<(), DebugProbeError> {
+        log::debug!(
+            "Read mem 8 bit, address={:08x}, length={}",
+            address,
+            data.len()
+        );
+
+        let data_len = data.len();
 
         self.device.write(
             &[
@@ -852,18 +843,18 @@ impl<D: StLinkUsb> STLink<D> {
                 (address >> 8) as u8,
                 (address >> 16) as u8,
                 (address >> 24) as u8,
-                length as u8,
-                (length >> 8) as u8,
+                data_len as u8,
+                (data_len >> 8) as u8,
                 apsel,
             ],
             &[],
-            &mut receive_buffer,
+            data,
             TIMEOUT,
         )?;
 
         self.get_last_rw_status()?;
 
-        Ok(receive_buffer)
+        Ok(())
     }
 
     fn write_mem_32bit(
@@ -999,7 +990,7 @@ impl<D: StLinkUsb> STLink<D> {
         self.send_jtag_command(&cmd, &[], &mut buff, TIMEOUT)
     }
 
-    fn _read_core_reg(&mut self, index: u32) -> Result<u32, DebugProbeError> {
+    fn read_core_reg(&mut self, index: u32) -> Result<u32, DebugProbeError> {
         log::trace!("Read core reg {:08x}", index);
         let mut buff = [0u8; 8];
 
@@ -1018,7 +1009,7 @@ impl<D: StLinkUsb> STLink<D> {
         Ok(response)
     }
 
-    fn _write_core_reg(&mut self, index: u32, value: u32) -> Result<(), DebugProbeError> {
+    fn write_core_reg(&mut self, index: u32, value: u32) -> Result<(), DebugProbeError> {
         log::trace!("Write core reg {:08x}", index);
         let mut buff = [0u8; 2];
 
@@ -1172,30 +1163,6 @@ impl StlinkArmDebug {
         }
     }
 
-    /// Read the given register `R` of the given `AP`, where the read register value is wrapped in
-    /// the given `register` parameter.
-    pub fn read_ap_register<AP, R>(
-        &mut self,
-        port: impl Into<AP>,
-        _register: R,
-    ) -> Result<R, DebugProbeError>
-    where
-        AP: AccessPort,
-        R: APRegister<AP>,
-    {
-        log::debug!("Reading register {}", R::NAME);
-        self.select_ap_and_ap_bank(port.into().port_number(), R::APBANKSEL)?;
-
-        let result = self.probe.read_register(
-            PortType::AccessPort(u16::from(self.state.current_apsel)),
-            u16::from(R::ADDRESS),
-        )?;
-
-        log::debug!("Read register    {}, value=0x{:08x}", R::NAME, result);
-
-        Ok(R::from(result))
-    }
-
     fn select_dp_bank(&mut self, dp_bank: DPBankSel) -> Result<(), DebugPortError> {
         match dp_bank {
             DPBankSel::Bank(new_bank) => {
@@ -1257,97 +1224,6 @@ impl StlinkArmDebug {
 
         Ok(())
     }
-
-    /// Write the given register `R` of the given `AP`, where the to be written register value
-    /// is wrapped in the given `register` parameter.
-    pub fn write_ap_register<AP, R>(
-        &mut self,
-        port: impl Into<AP>,
-        register: R,
-    ) -> Result<(), DebugProbeError>
-    where
-        AP: AccessPort,
-        R: APRegister<AP>,
-    {
-        let register_value = register.into();
-
-        log::debug!(
-            "Writing register {}, value=0x{:08X}",
-            R::NAME,
-            register_value
-        );
-
-        self.select_ap_and_ap_bank(port.into().port_number(), R::APBANKSEL)?;
-
-        self.probe.write_register(
-            PortType::AccessPort(u16::from(self.state.current_apsel)),
-            u16::from(R::ADDRESS),
-            register_value,
-        )?;
-
-        // Read from AP register
-        Ok(())
-    }
-
-    // TODO: Fix this ugly: _register: R, values: &[u32]
-    /// Write the given register `R` of the given `AP` repeatedly, where the to be written register
-    /// values are stored in the `values` array. The values are written in the exact order they are
-    /// stored in the array.
-    pub fn write_ap_register_repeated<AP, R>(
-        &mut self,
-        port: impl Into<AP>,
-        _register: R,
-        values: &[u32],
-    ) -> Result<(), DebugProbeError>
-    where
-        AP: AccessPort,
-        R: APRegister<AP>,
-    {
-        log::debug!(
-            "Writing register {}, block with len={} words",
-            R::NAME,
-            values.len(),
-        );
-
-        self.select_ap_and_ap_bank(port.into().port_number(), R::APBANKSEL)?;
-
-        self.probe.write_block(
-            PortType::AccessPort(u16::from(self.state.current_apsel)),
-            u16::from(R::ADDRESS),
-            values,
-        )?;
-        Ok(())
-    }
-
-    // TODO: fix types, see above!
-    /// Read the given register `R` of the given `AP` repeatedly, where the read register values
-    /// are stored in the `values` array. The values are read in the exact order they are stored in
-    /// the array.
-    pub fn read_ap_register_repeated<AP, R>(
-        &mut self,
-        port: impl Into<AP>,
-        _register: R,
-        values: &mut [u32],
-    ) -> Result<(), DebugProbeError>
-    where
-        AP: AccessPort,
-        R: APRegister<AP>,
-    {
-        log::debug!(
-            "Reading register {}, block with len={} words",
-            R::NAME,
-            values.len(),
-        );
-
-        self.select_ap_and_ap_bank(port.into().port_number(), R::APBANKSEL)?;
-
-        self.probe.read_block(
-            PortType::AccessPort(u16::from(self.state.current_apsel)),
-            u16::from(R::ADDRESS),
-            values,
-        )?;
-        Ok(())
-    }
 }
 
 impl DPAccess for StlinkArmDebug {
@@ -1393,12 +1269,9 @@ impl DPAccess for StlinkArmDebug {
 
 impl<'probe> ArmProbeInterface for StlinkArmDebug {
     fn memory_interface(&mut self, access_port: MemoryAP) -> Result<Memory<'_>, ProbeRsError> {
-        let interface = StLinkMemoryInterface {
-            probe: self,
-            access_port,
-        };
+        let interface = StLinkMemoryInterface { probe: self };
 
-        Ok(Memory::new(interface))
+        Ok(Memory::new(interface, access_port))
     }
 
     fn ap_information(
@@ -1461,30 +1334,95 @@ where
 {
     type Error = DebugProbeError;
 
-    fn read_ap_register(&mut self, port: impl Into<AP>, register: R) -> Result<R, Self::Error> {
-        self.read_ap_register(port, register)
+    /// Read the given register `R` of the given `AP`, where the read register value is wrapped in
+    /// the given `register` parameter.
+    fn read_ap_register(&mut self, port: impl Into<AP>, _register: R) -> Result<R, Self::Error> {
+        log::debug!("Reading register {}", R::NAME);
+        self.select_ap_and_ap_bank(port.into().port_number(), R::APBANKSEL)?;
+
+        let result = self.probe.read_register(
+            PortType::AccessPort(u16::from(self.state.current_apsel)),
+            u16::from(R::ADDRESS),
+        )?;
+
+        log::debug!("Read register    {}, value=0x{:08x}", R::NAME, result);
+
+        Ok(result.into())
     }
 
+    /// Write the given register `R` of the given `AP`, where the to be written register value
+    /// is wrapped in the given `register` parameter.
     fn write_ap_register(&mut self, port: impl Into<AP>, register: R) -> Result<(), Self::Error> {
-        self.write_ap_register(port, register)
+        let register_value = register.into();
+
+        log::debug!(
+            "Writing register {}, value=0x{:08X}",
+            R::NAME,
+            register_value
+        );
+
+        self.select_ap_and_ap_bank(port.into().port_number(), R::APBANKSEL)?;
+
+        self.probe.write_register(
+            PortType::AccessPort(u16::from(self.state.current_apsel)),
+            u16::from(R::ADDRESS),
+            register_value,
+        )?;
+
+        // Read from AP register
+        Ok(())
     }
 
+    // TODO: Fix this ugly: _register: R, values: &[u32]
+    /// Write the given register `R` of the given `AP` repeatedly, where the to be written register
+    /// values are stored in the `values` array. The values are written in the exact order they are
+    /// stored in the array.
     fn write_ap_register_repeated(
         &mut self,
         port: impl Into<AP> + Clone,
-        register: R,
+        _register: R,
         values: &[u32],
     ) -> Result<(), Self::Error> {
-        self.write_ap_register_repeated(port, register, values)
+        log::debug!(
+            "Writing register {}, block with len={} words",
+            R::NAME,
+            values.len(),
+        );
+
+        self.select_ap_and_ap_bank(port.into().port_number(), R::APBANKSEL)?;
+
+        self.probe.write_block(
+            PortType::AccessPort(u16::from(self.state.current_apsel)),
+            u16::from(R::ADDRESS),
+            values,
+        )?;
+        Ok(())
     }
 
+    // TODO: fix types, see above!
+    /// Read the given register `R` of the given `AP` repeatedly, where the read register values
+    /// are stored in the `values` array. The values are read in the exact order they are stored in
+    /// the array.
     fn read_ap_register_repeated(
         &mut self,
         port: impl Into<AP> + Clone,
-        register: R,
+        _register: R,
         values: &mut [u32],
     ) -> Result<(), Self::Error> {
-        self.read_ap_register_repeated(port, register, values)
+        log::debug!(
+            "Reading register {}, block with len={} words",
+            R::NAME,
+            values.len(),
+        );
+
+        self.select_ap_and_ap_bank(port.into().port_number(), R::APBANKSEL)?;
+
+        self.probe.read_block(
+            PortType::AccessPort(u16::from(self.state.current_apsel)),
+            u16::from(R::ADDRESS),
+            values,
+        )?;
+        Ok(())
     }
 }
 
@@ -1517,81 +1455,61 @@ impl SwoAccess for StlinkArmDebug {
 #[derive(Debug)]
 struct StLinkMemoryInterface<'probe> {
     probe: &'probe mut StlinkArmDebug,
-    access_port: MemoryAP,
 }
 
-impl MemoryInterface for StLinkMemoryInterface<'_> {
-    fn read_word_32(&mut self, address: u32) -> Result<u32, ProbeRsError> {
-        self.probe.select_ap(self.access_port)?;
+impl ArmProbe for StLinkMemoryInterface<'_> {
+    fn read_32(
+        &mut self,
+        ap: MemoryAP,
+        address: u32,
+        data: &mut [u32],
+    ) -> Result<(), ProbeRsError> {
+        self.probe.select_ap(ap)?;
 
-        let mut buff = [0];
-        self.read_32(address, &mut buff)?;
+        // Read needs to be chunked into chunks with max length 6144 bytes
+        for (index, chunk) in data.chunks_mut(STLINK_MAX_READ_LEN / 4).enumerate() {
+            let mut buff = vec![0u8; 4 * chunk.len()];
 
-        Ok(buff[0])
-    }
+            self.probe.probe.read_mem_32bit(
+                address + (index * STLINK_MAX_READ_LEN) as u32,
+                &mut buff,
+                ap.port_number(),
+            )?;
 
-    fn read_word_8(&mut self, address: u32) -> Result<u8, ProbeRsError> {
-        self.probe.select_ap(self.access_port)?;
-
-        let mut buff = [0u8];
-        self.read_8(address, &mut buff)?;
-
-        Ok(buff[0])
-    }
-
-    fn read_32(&mut self, address: u32, data: &mut [u32]) -> Result<(), ProbeRsError> {
-        self.probe.select_ap(self.access_port)?;
-
-        let received_words = self.probe.probe.read_mem_32bit(
-            address,
-            data.len() as u16,
-            self.access_port.port_number(),
-        )?;
-
-        data.copy_from_slice(&received_words);
+            for (index, word) in buff.chunks_exact(4).enumerate() {
+                chunk[index] = u32::from_le_bytes(word.try_into().unwrap());
+            }
+        }
 
         Ok(())
     }
 
-    fn read_8(&mut self, address: u32, data: &mut [u8]) -> Result<(), ProbeRsError> {
-        self.probe.select_ap(self.access_port)?;
-
-        let received_words = self.probe.probe.read_mem_8bit(
-            address,
-            data.len() as u16,
-            self.access_port.port_number(),
-        )?;
-
-        data.copy_from_slice(&received_words);
-
-        Ok(())
-    }
-
-    fn write_word_32(&mut self, address: u32, data: u32) -> Result<(), ProbeRsError> {
-        self.probe.select_ap(self.access_port)?;
-
-        self.write_32(address, &[data])?;
-
-        Ok(())
-    }
-
-    fn write_word_8(&mut self, address: u32, data: u8) -> Result<(), ProbeRsError> {
-        self.probe.select_ap(self.access_port)?;
-
-        self.write_8(address, &[data])
-    }
-
-    fn write_32(&mut self, address: u32, data: &[u32]) -> Result<(), ProbeRsError> {
-        self.probe.select_ap(self.access_port)?;
+    fn read_8(&mut self, ap: MemoryAP, address: u32, data: &mut [u8]) -> Result<(), ProbeRsError> {
+        self.probe.select_ap(ap)?;
 
         self.probe
             .probe
-            .write_mem_32bit(address, data, self.access_port.port_number())?;
+            .read_mem_8bit(address, data, ap.port_number())?;
+
         Ok(())
     }
 
-    fn write_8(&mut self, address: u32, data: &[u8]) -> Result<(), ProbeRsError> {
-        self.probe.select_ap(self.access_port)?;
+    fn write_32(&mut self, ap: MemoryAP, address: u32, data: &[u32]) -> Result<(), ProbeRsError> {
+        self.probe.select_ap(ap)?;
+
+        for (index, chunk) in data.chunks(16384 / 4).enumerate() {
+            self.probe.probe.write_mem_32bit(
+                address + (index * STLINK_MAX_WRITE_LEN) as u32,
+                chunk,
+                ap.port_number(),
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn write_8(&mut self, ap: MemoryAP, address: u32, data: &[u8]) -> Result<(), ProbeRsError> {
+        self.probe.select_ap(ap)?;
 
         let chunk_size = if self.probe.probe.hw_version < 3 {
             64
@@ -1604,7 +1522,7 @@ impl MemoryInterface for StLinkMemoryInterface<'_> {
             log::trace!("write_8: small - direct 8 bit write to {:08x}", address);
             self.probe
                 .probe
-                .write_mem_8bit(address, data, self.access_port.port_number())?;
+                .write_mem_8bit(address, data, ap.port_number())?;
         } else {
             // Handle unaligned data in the beginning.
             let bytes_beginning = if address % 4 == 0 {
@@ -1624,7 +1542,7 @@ impl MemoryInterface for StLinkMemoryInterface<'_> {
                 self.probe.probe.write_mem_8bit(
                     current_address,
                     &data[..bytes_beginning],
-                    self.access_port.port_number(),
+                    ap.port_number(),
                 )?;
 
                 current_address += bytes_beginning as u32;
@@ -1646,11 +1564,9 @@ impl MemoryInterface for StLinkMemoryInterface<'_> {
                 current_address,
             );
 
-            self.probe.probe.write_mem_32bit(
-                current_address,
-                &words,
-                self.access_port.port_number(),
-            )?;
+            self.probe
+                .probe
+                .write_mem_32bit(current_address, &words, ap.port_number())?;
 
             current_address += (words.len() * 4) as u32;
 
@@ -1665,7 +1581,7 @@ impl MemoryInterface for StLinkMemoryInterface<'_> {
                 self.probe.probe.write_mem_8bit(
                     current_address,
                     remaining_bytes,
-                    self.access_port.port_number(),
+                    ap.port_number(),
                 )?;
             }
         }
@@ -1674,6 +1590,31 @@ impl MemoryInterface for StLinkMemoryInterface<'_> {
 
     fn flush(&mut self) -> Result<(), ProbeRsError> {
         self.probe.probe.flush()?;
+
+        Ok(())
+    }
+
+    fn read_core_reg(
+        &mut self,
+        _ap: MemoryAP,
+        addr: crate::CoreRegisterAddress,
+    ) -> Result<u32, ProbeRsError> {
+        // Unclear how this works with multiple APs
+
+        let value = self.probe.probe.read_core_reg(addr.0 as u32)?;
+
+        Ok(value)
+    }
+
+    fn write_core_reg(
+        &mut self,
+        _ap: MemoryAP,
+        addr: crate::CoreRegisterAddress,
+        value: u32,
+    ) -> Result<(), ProbeRsError> {
+        // Unclear how this works with multiple APs
+
+        self.probe.probe.write_core_reg(addr.0 as u32, value)?;
 
         Ok(())
     }
