@@ -525,6 +525,9 @@ impl<'probe, O: Operation> ActiveFlasher<'probe, O> {
         duration: Duration,
     ) -> Result<u32> {
         self.call_function(registers, init)?;
+
+        // TODO: come up with a more reliable method for avoiding DAP timeouts on nRF9160
+        std::thread::sleep(Duration::from_millis(100));
         self.wait_for_completion(duration)
     }
 
