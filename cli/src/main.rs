@@ -77,6 +77,9 @@ enum CLI {
         #[structopt(flatten)]
         shared: SharedOptions,
 
+        #[structopt(flatten)]
+        options: DownloadOptions,
+
         /// The path to the file to be downloaded to the flash
         path: String,
     },
@@ -110,6 +113,13 @@ struct SharedOptions {
     connect_under_reset: bool,
 }
 
+/// Download options
+#[derive(StructOpt)]
+struct DownloadOptions {
+    #[structopt(short, long)]
+    format: Option<String>,
+}
+
 fn main() -> Result<()> {
     // Initialize the logging backend.
     pretty_env_logger::init();
@@ -122,7 +132,7 @@ fn main() -> Result<()> {
         CLI::Reset { shared, assert } => reset_target_of_device(&shared, assert),
         CLI::Debug { shared, exe } => debug(&shared, exe),
         CLI::Dump { shared, loc, words } => dump_memory(&shared, loc, words),
-        CLI::Download { shared, path } => download_program_fast(&shared, &path),
+        CLI::Download { shared, options, path } => download_program_fast(&shared, &options, &path),
         CLI::Trace { shared, loc } => trace_u32_on_target(&shared, loc),
     }
 }
@@ -173,9 +183,15 @@ fn dump_memory(shared_options: &SharedOptions, loc: u32, words: u32) -> Result<(
     })
 }
 
-fn download_program_fast(shared_options: &SharedOptions, path: &str) -> Result<()> {
+fn download_program_fast(shared_options: &SharedOptions,  download_options: &DownloadOptions, path: &str) -> Result<()> {
+
+    let format = match download_options.format.as_ref().map(String::as_str) {
+        Some("hex")=> Format::Hex,
+        _=>Format::Elf
+    };
+
     with_device(shared_options, |mut session| {
-        download_file(&mut session, std::path::Path::new(&path), Format::Elf)?;
+        download_file(&mut session, std::path::Path::new(&path), format)?;
 
         Ok(())
     })
