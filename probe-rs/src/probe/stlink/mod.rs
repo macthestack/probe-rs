@@ -38,6 +38,7 @@ const STLINK_MAX_WRITE_LEN: usize = 0xFFFC;
 #[derive(Debug)]
 pub struct STLink<D: StLinkUsb> {
     device: D,
+    name: String,
     hw_version: u8,
     jtag_version: u8,
     protocol: WireProtocol,
@@ -53,8 +54,10 @@ impl DebugProbe for STLink<STLinkUSBDevice> {
     fn new_from_selector(
         selector: impl Into<DebugProbeSelector>,
     ) -> Result<Box<Self>, DebugProbeError> {
+        let device = STLinkUSBDevice::new_from_selector(selector)?;
         let mut stlink = Self {
-            device: STLinkUSBDevice::new_from_selector(selector)?,
+            name: format!("ST-Link {}", &device.info.version_name),
+            device,
             hw_version: 0,
             jtag_version: 0,
             protocol: WireProtocol::Swd,
@@ -71,7 +74,7 @@ impl DebugProbe for STLink<STLinkUSBDevice> {
     }
 
     fn get_name(&self) -> &str {
-        "ST-Link"
+        &self.name
     }
 
     fn speed(&self) -> u32 {
@@ -253,6 +256,10 @@ impl DebugProbe for STLink<STLinkUSBDevice> {
     fn has_arm_interface(&self) -> bool {
         true
     }
+
+    fn into_probe(self: Box<Self>) -> Box<dyn DebugProbe> {
+        self
+    }
 }
 
 impl DAPAccess for STLink<STLinkUSBDevice> {
@@ -314,10 +321,6 @@ impl DAPAccess for STLink<STLinkUSBDevice> {
         } else {
             Err(StlinkError::BlanksNotAllowedOnDPRegister.into())
         }
-    }
-
-    fn into_probe(self: Box<Self>) -> Box<dyn DebugProbe> {
-        self
     }
 }
 
@@ -1694,6 +1697,7 @@ mod test {
         fn build(self) -> STLink<MockUsb> {
             STLink {
                 device: self,
+                name: "Mock STlink".into(),
                 hw_version: 0,
                 protocol: WireProtocol::Swd,
                 jtag_version: 0,
